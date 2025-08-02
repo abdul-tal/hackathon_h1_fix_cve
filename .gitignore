@@ -22,4 +22,6 @@ Thumbs.db
 .idea/
 
 # Docker test images
-cve-fix-test 
+cve-fix-test # Trivy cache files (too large for GitHub)
+trivy-cache/
+*.db
