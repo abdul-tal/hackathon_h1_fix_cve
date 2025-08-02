@@ -1,0 +1,36 @@
+{
+  "name": "cve-fix-agent",
+  "version": "1.0.0",
+  "description": "CVE Fix AI Agent - LangChain Powered Hackathon POC",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "setup": "node scripts/setup-check.js",
+    "check-config": "node scripts/setup-check.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "uuid": "^9.0.0",
+    "axios": "^1.5.0",
+    "fs-extra": "^11.1.1",
+    "dotenv": "^16.3.1",
+    "langchain": "^0.0.208",
+    "@langchain/core": "^0.1.10",
+    "@langchain/openai": "^0.0.14",
+    "@langchain/community": "^0.0.20",
+    "dockerode": "^4.0.2",
+    "joi": "^17.11.0",
+    "winston": "^3.11.0",
+    "semver": "^7.5.4",
+    "dockerfile-ast": "^0.6.1",
+    "child_process": "^1.0.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": ["cve", "docker", "security", "automation", "langchain", "agent"],
+  "author": "Hackathon Team",
+  "license": "MIT"
+} 
