@@ -53,6 +53,12 @@ class CVEFixAgent {
       logger.warn('OpenAI API key not configured - agent will run in mock mode');
       return;
     }
+    
+    // Force direct workflow mode to bypass LangChain parsing issues
+    if (process.env.FORCE_DIRECT_MODE === 'true') {
+      logger.info('Forcing direct workflow mode - LangChain agent disabled');
+      return;
+    }
 
     try {
       this.llm = new ChatOpenAI({

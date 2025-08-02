@@ -111,16 +111,16 @@ class DockerHubAPI {
       // Normalize image name for API
       const normalizedName = this.normalizeImageName(imageName);
       
-      // Get auth token
-      const token = await this.getAuthToken(normalizedName);
-      
+      // Skip authentication for public repositories (causes 401 errors)
       const headers = {};
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
-      }
+      // Note: Public repositories don't need authentication
+      // const token = await this.getAuthToken(normalizedName);
+      // if (token) {
+      //   headers['Authorization'] = `Bearer ${token}`;
+      // }
 
       const allTags = [];
-      let url = `${this.baseURL}/repositories/${normalizedName}/tags`;
+      let url = `${this.hubURL}/repositories/${normalizedName}/tags`;
       let hasNextPage = true;
 
       // Fetch all pages of tags
@@ -158,7 +158,19 @@ class DockerHubAPI {
       }
 
       // Sort tags by semantic version where possible
-      const sortedTags = this.sortTagsBySemver(allTags);
+      let sortedTags = this.sortTagsBySemver(allTags);
+      
+      // Apply Ubuntu-specific filtering for Ubuntu images
+      if (normalizedName === 'library/ubuntu' || normalizedName === 'ubuntu') {
+        const beforeCount = sortedTags.length;
+        sortedTags = this.filterSupportedUbuntuVersions(sortedTags);
+        logger.info('Applied Ubuntu version filtering to available tags', {
+          imageName,
+          beforeCount,
+          afterCount: sortedTags.length,
+          filtered: beforeCount - sortedTags.length
+        });
+      }
 
       // Cache the results
       this.cache.set(cacheKey, {
@@ -196,15 +208,17 @@ class DockerHubAPI {
       logger.debug('Fetching image info', { imageName, tag });
 
       const normalizedName = this.normalizeImageName(imageName);
-      const token = await this.getAuthToken(normalizedName);
       
+      // Skip authentication for public repositories (causes 401 errors)
       const headers = {};
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
-      }
+      // Note: Public repositories don't need authentication
+      // const token = await this.getAuthToken(normalizedName);
+      // if (token) {
+      //   headers['Authorization'] = `Bearer ${token}`;
+      // }
 
       const response = await axios.get(
-        `${this.baseURL}/repositories/${normalizedName}/tags/${tag}`,
+        `${this.hubURL}/repositories/${normalizedName}/tags/${tag}`,
         {
           headers,
           timeout: 10000
@@ -247,7 +261,18 @@ class DockerHubAPI {
       }
 
       // Filter out non-release tags
-      const releaseTags = this.filterReleaseTags(tags);
+      let releaseTags = this.filterReleaseTags(tags);
+      
+      // Apply Ubuntu-specific filtering for Ubuntu images
+      const normalizedName = this.normalizeImageName(imageName);
+      if (normalizedName === 'library/ubuntu' || normalizedName === 'ubuntu') {
+        releaseTags = this.filterSupportedUbuntuVersions(releaseTags);
+        logger.info('Applied Ubuntu-specific version filtering', {
+          imageName,
+          originalCount: tags.length,
+          filteredCount: releaseTags.length
+        });
+      }
       
       if (releaseTags.length === 0) {
         logger.warn('No release tags found, using all tags', { imageName });
@@ -322,7 +347,69 @@ class DockerHubAPI {
     });
   }
 
-  // Sort tags by semantic version
+  // Enhanced filtering for Ubuntu-specific versions
+  filterSupportedUbuntuVersions(tags) {
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth() + 1; // JavaScript months are 0-based
+    
+    // Ubuntu LTS versions (Long Term Support - 5 years)
+    const ltsVersions = [
+      '24.04', '22.04', '20.04', '18.04', '16.04', '14.04'
+    ];
+    
+    // End-of-life Ubuntu versions (approximate dates)
+    const eolVersions = [
+      '23.10', '23.04', '22.10', '21.10', '21.04', '20.10', 
+      '19.10', '19.04', '18.10', '17.10', '17.04', '16.10',
+      '12.04', '10.04', '8.04'
+    ];
+
+    return tags.filter(tag => {
+      const tagName = tag.name;
+      
+      // Check if it's a Ubuntu version format (XX.XX or XX.XX.X)
+      const ubuntuVersionMatch = tagName.match(/^(\d{2})\.(\d{2})(?:\.(\d+))?$/);
+      if (!ubuntuVersionMatch) {
+        return true; // Keep non-version tags
+      }
+      
+      const [, year, month, patch] = ubuntuVersionMatch;
+      const versionString = `${year}.${month}`;
+      
+      // Priority 1: Always include LTS versions (unless very old)
+      if (ltsVersions.includes(versionString)) {
+        const versionYear = parseInt(year, 10) + 2000;
+        return versionYear >= 2016; // Keep LTS from 16.04 onwards
+      }
+      
+      // Priority 2: Exclude known EOL versions
+      if (eolVersions.includes(versionString)) {
+        logger.debug('Filtering out EOL Ubuntu version', { version: tagName });
+        return false;
+      }
+      
+      // Priority 3: Filter interim releases (.10 versions) that are likely EOL
+      if (month === '10') {
+        const versionYear = parseInt(year, 10) + 2000;
+        const releaseDate = new Date(versionYear, 9); // October = month 9
+        const monthsSinceRelease = (now - releaseDate) / (1000 * 60 * 60 * 24 * 30);
+        
+        // Ubuntu interim releases have 9-month support
+        if (monthsSinceRelease > 9) {
+          logger.debug('Filtering out expired interim Ubuntu version', { 
+            version: tagName, 
+            monthsSinceRelease: Math.round(monthsSinceRelease) 
+          });
+          return false;
+        }
+      }
+      
+      return true;
+    });
+  }
+
+  // Sort tags by semantic version with Ubuntu LTS prioritization
   sortTagsBySemver(tags) {
     const semverTags = [];
     const nonSemverTags = [];
@@ -335,10 +422,20 @@ class DockerHubAPI {
       }
     }
 
-    // Sort semantic version tags in descending order (newest first)
+    // Sort semantic version tags with Ubuntu LTS prioritization
     semverTags.sort((a, b) => {
       const versionA = semver.coerce(a.name);
       const versionB = semver.coerce(b.name);
+      
+      // Check if these are Ubuntu LTS versions
+      const isLtsA = this.isUbuntuLTS(a.name);
+      const isLtsB = this.isUbuntuLTS(b.name);
+      
+      // Prioritize LTS versions
+      if (isLtsA && !isLtsB) return -1;
+      if (!isLtsA && isLtsB) return 1;
+      
+      // Both LTS or both non-LTS, sort by version (newest first)
       return semver.rcompare(versionA, versionB);
     });
 
@@ -351,6 +448,12 @@ class DockerHubAPI {
 
     // Return semantic versions first, then others
     return [...semverTags, ...nonSemverTags];
+  }
+
+  // Check if a version is Ubuntu LTS
+  isUbuntuLTS(version) {
+    const ltsVersions = ['24.04', '22.04', '20.04', '18.04', '16.04', '14.04'];
+    return ltsVersions.some(lts => version.startsWith(lts));
   }
 
   // Get versions newer than a specific version
