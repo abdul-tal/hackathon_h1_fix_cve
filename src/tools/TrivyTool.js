@@ -327,6 +327,269 @@ class TrivyTool {
 
     return summary;
   }
+
+  // Scan image for all CVEs (new method for comprehensive scanning)
+  async scanImageForAllCVEs(imageName, imageTag) {
+    try {
+      logger.info('Starting comprehensive CVE scan', {
+        imageName,
+        imageTag
+      });
+
+      if (this.mockMode) {
+        return this.getMockAllCVEResults(imageName, imageTag);
+      }
+
+      // Ensure Trivy is installed
+      await this.checkTrivyInstalled();
+
+      // Update database
+      await this.updateDatabase();
+
+      // Build the full image name
+      const fullImageName = `${imageName}:${imageTag}`;
+
+      // Run comprehensive Trivy scan
+      const scanCommand = [
+        'trivy',
+        'image',
+        '--format', 'json',
+        '--severity', 'LOW,MEDIUM,HIGH,CRITICAL',
+        '--cache-dir', this.cacheDir,
+        '--timeout', '10m',
+        '--quiet',
+        fullImageName
+      ].join(' ');
+
+      logger.debug('Running Trivy scan command', { command: scanCommand });
+
+      const { stdout, stderr } = await execAsync(scanCommand, {
+        timeout: this.timeout
+      });
+
+      if (stderr) {
+        logger.warn('Trivy scan warnings', { 
+          imageName: fullImageName,
+          stderr: stderr.substring(0, 500)
+        });
+      }
+
+      // Parse the JSON output
+      const scanResults = JSON.parse(stdout);
+      const cveResults = this.parseComprehensiveResults(scanResults, fullImageName);
+
+      logger.info('Comprehensive CVE scan completed', {
+        imageName: fullImageName,
+        totalCVEs: cveResults.totalCVEs,
+        severityBreakdown: cveResults.severityBreakdown
+      });
+
+      return cveResults;
+
+    } catch (error) {
+      logger.error('Comprehensive CVE scan failed', {
+        imageName,
+        imageTag,
+        error: error.message
+      });
+      throw new Error(`Comprehensive CVE scan failed: ${error.message}`);
+    }
+  }
+
+  // Parse comprehensive scan results from Trivy JSON output
+  parseComprehensiveResults(scanResults, imageName) {
+    const allCVEs = [];
+    const severityBreakdown = {
+      LOW: 0,
+      MEDIUM: 0,
+      HIGH: 0,
+      CRITICAL: 0
+    };
+
+    // Trivy returns results for different components (OS packages, libraries, etc.)
+    if (scanResults.Results) {
+      for (const result of scanResults.Results) {
+        if (result.Vulnerabilities) {
+          for (const vuln of result.Vulnerabilities) {
+            const cve = {
+              cveId: vuln.VulnerabilityID,
+              severity: vuln.Severity || 'UNKNOWN',
+              description: vuln.Description || vuln.Title || 'No description available',
+              packageName: vuln.PkgName,
+              installedVersion: vuln.InstalledVersion,
+              fixedVersion: vuln.FixedVersion || null,
+              references: vuln.References || [],
+              publishedDate: vuln.PublishedDate,
+              lastModifiedDate: vuln.LastModifiedDate,
+              source: result.Target || 'Unknown'
+            };
+
+            allCVEs.push(cve);
+            
+            // Update severity breakdown
+            if (severityBreakdown.hasOwnProperty(cve.severity)) {
+              severityBreakdown[cve.severity]++;
+            }
+          }
+        }
+      }
+    }
+
+    // Remove duplicates (same CVE might appear in multiple packages)
+    const uniqueCVEs = this.deduplicateCVEs(allCVEs);
+
+    return {
+      imageName,
+      totalCVEs: uniqueCVEs.length,
+      severityBreakdown,
+      cves: uniqueCVEs,
+      scanDate: new Date().toISOString(),
+      trivyVersion: scanResults.Metadata?.NextUpdate || 'Unknown'
+    };
+  }
+
+  // Deduplicate CVEs (keep the highest severity and most complete info)
+  deduplicateCVEs(cveList) {
+    const cveMap = new Map();
+
+    for (const cve of cveList) {
+      const existing = cveMap.get(cve.cveId);
+      
+      if (!existing) {
+        cveMap.set(cve.cveId, cve);
+      } else {
+        // Keep the CVE with higher severity or more complete information
+        const severityOrder = { 'CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1, 'UNKNOWN': 0 };
+        const existingSeverity = severityOrder[existing.severity] || 0;
+        const currentSeverity = severityOrder[cve.severity] || 0;
+
+        if (currentSeverity > existingSeverity || 
+            (currentSeverity === existingSeverity && cve.description.length > existing.description.length)) {
+          cveMap.set(cve.cveId, cve);
+        }
+      }
+    }
+
+    return Array.from(cveMap.values());
+  }
+
+  // Check specific CVEs in a version (updated method for batch checking)
+  async checkMultipleCVEsInVersion(imageName, imageTag, cveIds) {
+    try {
+      logger.info('Checking multiple CVEs in version', {
+        imageName,
+        imageTag,
+        cveCount: cveIds.length
+      });
+
+      // Get all CVEs for this image
+      const allCVEResults = await this.scanImageForAllCVEs(imageName, imageTag);
+      
+      // Filter to only the requested CVEs
+      const requestedCVEs = {};
+      
+      for (const cveId of cveIds) {
+        const cveData = allCVEResults.cves.find(cve => cve.cveId === cveId);
+        
+        if (cveData) {
+          requestedCVEs[cveId] = {
+            exists: true,
+            severity: cveData.severity,
+            description: cveData.description,
+            fixedVersion: cveData.fixedVersion,
+            packageName: cveData.packageName,
+            installedVersion: cveData.installedVersion
+          };
+        } else {
+          requestedCVEs[cveId] = {
+            exists: false,
+            severity: 'N/A',
+            description: 'CVE not found in this version',
+            fixedVersion: null
+          };
+        }
+      }
+
+      return {
+        imageName: `${imageName}:${imageTag}`,
+        totalRequested: cveIds.length,
+        foundCVEs: Object.values(requestedCVEs).filter(cve => cve.exists).length,
+        results: requestedCVEs,
+        scanDate: new Date().toISOString()
+      };
+
+    } catch (error) {
+      logger.error('Multiple CVE check failed', {
+        imageName,
+        imageTag,
+        cveIds,
+        error: error.message
+      });
+      throw new Error(`Multiple CVE check failed: ${error.message}`);
+    }
+  }
+
+  // Mock results for comprehensive scanning (for testing)
+  getMockAllCVEResults(imageName, imageTag) {
+    logger.info('Using mock comprehensive CVE results', { imageName, imageTag });
+
+    const mockCVEs = [
+      {
+        cveId: 'CVE-2021-3711',
+        severity: 'HIGH',
+        description: 'OpenSSL buffer overflow vulnerability affecting SM2 decryption',
+        packageName: 'openssl',
+        installedVersion: '1.1.1f',
+        fixedVersion: '1.1.1l',
+        source: 'OS packages'
+      },
+      {
+        cveId: 'CVE-2022-0778',
+        severity: 'HIGH',
+        description: 'OpenSSL infinite loop vulnerability in BN_mod_sqrt()',
+        packageName: 'openssl',
+        installedVersion: '1.1.1f',
+        fixedVersion: '1.1.1n',
+        source: 'OS packages'
+      },
+      {
+        cveId: 'CVE-2023-0286',
+        severity: 'MEDIUM',
+        description: 'OpenSSL X.400 address type confusion vulnerability',
+        packageName: 'openssl',
+        installedVersion: '1.1.1f',
+        fixedVersion: '3.0.8',
+        source: 'OS packages'
+      }
+    ];
+
+    // Filter CVEs based on image version (older versions have more CVEs)
+    const isOldVersion = imageTag.includes('18.04') || 
+                        parseInt(imageTag.split('.')[0]) < 20 ||
+                        imageTag === '1.0' || imageTag === '1.1';
+
+    const filteredCVEs = isOldVersion ? mockCVEs : mockCVEs.slice(0, 1);
+
+    const severityBreakdown = {
+      LOW: 0,
+      MEDIUM: 0,
+      HIGH: 0,
+      CRITICAL: 0
+    };
+
+    filteredCVEs.forEach(cve => {
+      severityBreakdown[cve.severity]++;
+    });
+
+    return {
+      imageName: `${imageName}:${imageTag}`,
+      totalCVEs: filteredCVEs.length,
+      severityBreakdown,
+      cves: filteredCVEs,
+      scanDate: new Date().toISOString(),
+      trivyVersion: 'mock-mode'
+    };
+  }
 }
 
 module.exports = TrivyTool; 

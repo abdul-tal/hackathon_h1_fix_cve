@@ -1,5 +1,6 @@
 # Example Dockerfile for testing CVE fix tool
-FROM ubuntu:25.10
+# This uses Ubuntu 18.04 which has CVE-2021-3711
+FROM ubuntu:22.04
 
 LABEL maintainer="hackathon-team"
 LABEL description="Example vulnerable Dockerfile for CVE fix demo"

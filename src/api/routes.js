@@ -1,5 +1,5 @@
 const express = require('express');
-const { validateFixCveRequest, validateDockerfileExists, sanitizeInput } = require('./validation');
+const { validateFixCveRequest, validateDockerfileExists, sanitizeInput, validateGitHubToken } = require('./validation');
 const CVEFixOrchestrator = require('../utils/CVEFixOrchestrator');
 const logger = require('../utils/logger');
 
@@ -88,14 +88,15 @@ router.get('/requirements', async (req, res) => {
 // Main CVE fix endpoint
 router.post('/fix-cve', [
   validateFixCveRequest,
+  validateGitHubToken,
   validateDockerfileExists,
   sanitizeInput
 ], async (req, res) => {
-  const { cve_id } = req.validatedBody;
+  const { github_repo, github_token } = req.validatedBody;
   const startTime = Date.now();
   
   req.logger.info('CVE fix request received', {
-    cveId: cve_id
+    githubRepo: github_repo
   });
 
   // Ensure we always respond, even if something goes wrong
@@ -115,18 +116,24 @@ router.post('/fix-cve', [
   // Set up a fail-safe timeout (4.5 minutes, shorter than middleware timeout)
   const failsafeTimeout = setTimeout(() => {
     req.logger.warn('CVE fix request approaching timeout', {
-      cveId: cve_id,
+      githubRepo: github_repo,
       elapsedTime: Date.now() - startTime
     });
     
     sendResponse(408, {
       status: 'failure',
-      message: 'CVE fix request timed out. Please try again with a simpler CVE or check system load.',
+      message: 'CVE fix request timed out. Please try again with a simpler repository or check system load.',
       original_version: null,
       fixed_version: null,
-      cve_details: {
-        severity: 'UNKNOWN',
-        description: 'Request timeout'
+      cve_summary: {
+        total_found: 0,
+        total_fixed: 0,
+        unfixable: 0,
+        severity_breakdown: { LOW: 0, MEDIUM: 0, HIGH: 0, CRITICAL: 0 }
+      },
+      github_info: {
+        repository: github_repo,
+        dockerfile_path: null
       },
       processingTime: `${Date.now() - startTime}ms`,
       errorType: 'timeout'
@@ -136,7 +143,7 @@ router.post('/fix-cve', [
   try {
     // Process CVE fix using orchestrator with timeout wrapper
     const result = await Promise.race([
-      orchestrator.processCVEFix({ cve_id }),
+      orchestrator.processCVEFix({ github_repo, github_token }),
       new Promise((_, reject) => {
         setTimeout(() => reject(new Error('Operation timeout')), 240000); // 4 minutes
       })
@@ -145,8 +152,10 @@ router.post('/fix-cve', [
     clearTimeout(failsafeTimeout);
 
     req.logger.info('CVE fix request completed', {
-      cveId: cve_id,
+      githubRepo: github_repo,
       status: result.status,
+      totalCVEs: result.cve_summary?.total_found || 0,
+      fixedCVEs: result.cve_summary?.total_fixed || 0,
       processingTime: result.processingTime
     });
 
@@ -156,6 +165,8 @@ router.post('/fix-cve', [
       statusCode = 500;
     } else if (result.status === 'no_fix_available') {
       statusCode = 200; // Not an error, just no fix available
+    } else if (result.status === 'no_action_needed') {
+      statusCode = 200; // No CVEs found, which is good
     }
 
     sendResponse(statusCode, result);
@@ -164,7 +175,7 @@ router.post('/fix-cve', [
     clearTimeout(failsafeTimeout);
     
     req.logger.error('CVE fix request failed', {
-      cveId: cve_id,
+      githubRepo: github_repo,
       error: error.message,
       stack: error.stack,
       processingTime: `${Date.now() - startTime}ms`
@@ -181,9 +192,15 @@ router.post('/fix-cve', [
         : `CVE fix failed: ${error.message}`,
       original_version: null,
       fixed_version: null,
-      cve_details: {
-        severity: 'UNKNOWN',
-        description: isTimeout ? 'Request timeout' : 'Processing failed'
+      cve_summary: {
+        total_found: 0,
+        total_fixed: 0,
+        unfixable: 0,
+        severity_breakdown: { LOW: 0, MEDIUM: 0, HIGH: 0, CRITICAL: 0 }
+      },
+      github_info: {
+        repository: github_repo,
+        dockerfile_path: null
       },
       processingTime: `${Date.now() - startTime}ms`,
       errorType

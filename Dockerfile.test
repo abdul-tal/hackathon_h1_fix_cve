@@ -1,0 +1,17 @@
+# Test Dockerfile with vulnerable Ubuntu version
+FROM ubuntu:18.04
+
+LABEL maintainer="cve-test"
+LABEL description="Test Dockerfile with known CVEs for demonstration"
+
+# Install packages (this version has known CVEs)
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Simple test command
+CMD ["echo", "Testing CVE fix tool"] 

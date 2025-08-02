@@ -456,6 +456,309 @@ class VersionFinder {
       };
     }
   }
+
+  // Find minimal version that fixes multiple CVEs (new method for comprehensive fixing)
+  async findMinimalFixVersionForMultipleCVEs(imageName, cveIds, currentVersion, options = {}) {
+    try {
+      logger.info('Starting multi-CVE version finder', {
+        imageName,
+        cveCount: cveIds.length,
+        currentVersion,
+        strategy: this.strategy
+      });
+
+      // Get available versions
+      const availableVersions = await this.getAvailableVersions(imageName, currentVersion, options);
+      
+      if (availableVersions.length === 0) {
+        logger.warn('No newer versions available for multi-CVE fix', { imageName, currentVersion });
+        return {
+          fixedVersion: null,
+          fixedCVEs: [],
+          unfixedCVEs: cveIds,
+          versionDetails: null
+        };
+      }
+
+      // First, check which CVEs are fixable by scanning the latest version
+      const latestVersion = availableVersions[availableVersions.length - 1];
+      const fixabilityCheck = await this.checkCVEFixability(imageName, latestVersion, cveIds);
+      
+      const fixableCVEs = fixabilityCheck.fixableCVEs;
+      const unfixableCVEs = fixabilityCheck.unfixableCVEs;
+
+      logger.info('CVE fixability analysis completed', {
+        totalCVEs: cveIds.length,
+        fixableCVEs: fixableCVEs.length,
+        unfixableCVEs: unfixableCVEs.length,
+        latestVersion
+      });
+
+      if (fixableCVEs.length === 0) {
+        return {
+          fixedVersion: null,
+          fixedCVEs: [],
+          unfixedCVEs: cveIds,
+          versionDetails: `No CVEs can be fixed. All ${cveIds.length} CVEs still exist in latest version ${latestVersion}`
+        };
+      }
+
+      // Find minimal version that fixes all fixable CVEs
+      const searchStrategy = this.chooseSearchStrategy(availableVersions.length, options.strategy);
+      
+      logger.info('Using search strategy for multi-CVE fix', {
+        strategy: searchStrategy,
+        versionsToCheck: availableVersions.length,
+        fixableCVEs: fixableCVEs.length
+      });
+
+      let fixedVersion;
+      if (searchStrategy === 'binary') {
+        fixedVersion = await this.binarySearchMultiCVEFix(imageName, fixableCVEs, availableVersions);
+      } else {
+        fixedVersion = await this.sequentialSearchMultiCVEFix(imageName, fixableCVEs, availableVersions);
+      }
+
+      const result = {
+        fixedVersion,
+        fixedCVEs: fixedVersion ? fixableCVEs : [],
+        unfixedCVEs: unfixableCVEs,
+        versionDetails: this.createVersionDetails(fixedVersion, fixableCVEs, unfixableCVEs, currentVersion)
+      };
+
+      logger.info('Multi-CVE version finder completed', {
+        imageName,
+        currentVersion,
+        fixedVersion,
+        fixedCVECount: result.fixedCVEs.length,
+        unfixedCVECount: result.unfixedCVEs.length
+      });
+
+      return result;
+
+    } catch (error) {
+      logger.error('Multi-CVE version finder failed', {
+        imageName,
+        cveIds,
+        currentVersion,
+        error: error.message
+      });
+      throw new Error(`Multi-CVE version finder failed: ${error.message}`);
+    }
+  }
+
+  // Check which CVEs can be fixed by examining the latest version
+  async checkCVEFixability(imageName, latestVersion, cveIds) {
+    try {
+      const latestCVECheck = await this.trivyTool.checkMultipleCVEsInVersion(
+        imageName, 
+        latestVersion, 
+        cveIds
+      );
+
+      const fixableCVEs = [];
+      const unfixableCVEs = [];
+
+      for (const cveId of cveIds) {
+        const cveResult = latestCVECheck.results[cveId];
+        if (cveResult && !cveResult.exists) {
+          fixableCVEs.push(cveId);
+        } else {
+          unfixableCVEs.push(cveId);
+        }
+      }
+
+      return { fixableCVEs, unfixableCVEs };
+
+    } catch (error) {
+      logger.error('CVE fixability check failed', {
+        imageName,
+        latestVersion,
+        cveIds,
+        error: error.message
+      });
+      throw new Error(`CVE fixability check failed: ${error.message}`);
+    }
+  }
+
+  // Sequential search for version that fixes multiple CVEs
+  async sequentialSearchMultiCVEFix(imageName, cveIds, versions) {
+    logger.info('Starting sequential search for multi-CVE fix', {
+      imageName,
+      cveCount: cveIds.length,
+      versionsToCheck: versions.length
+    });
+
+    for (let i = 0; i < versions.length; i++) {
+      const version = versions[i];
+      
+      try {
+        const allFixed = await this.checkAllCVEsFixed(imageName, version, cveIds);
+        
+        if (allFixed) {
+          logger.info('Found minimal fix version for all CVEs', {
+            imageName,
+            version,
+            checkedVersions: i + 1,
+            totalVersions: versions.length
+          });
+          return version;
+        }
+
+        // Add small delay to avoid overwhelming the system
+        if (i < versions.length - 1) {
+          await this.delay(100);
+        }
+
+      } catch (error) {
+        logger.warn('Error checking version during sequential search', {
+          imageName,
+          version,
+          error: error.message
+        });
+        // Continue with next version
+      }
+    }
+
+    logger.warn('No version found that fixes all CVEs', {
+      imageName,
+      cveIds,
+      versionsChecked: versions.length
+    });
+    
+    return null;
+  }
+
+  // Binary search for version that fixes multiple CVEs
+  async binarySearchMultiCVEFix(imageName, cveIds, versions) {
+    logger.info('Starting binary search for multi-CVE fix', {
+      imageName,
+      cveCount: cveIds.length,
+      versionsToCheck: versions.length
+    });
+
+    let left = 0;
+    let right = versions.length - 1;
+    let bestFixVersion = null;
+
+    while (left <= right) {
+      const mid = Math.floor((left + right) / 2);
+      const version = versions[mid];
+
+      try {
+        const allFixed = await this.checkAllCVEsFixed(imageName, version, cveIds);
+
+        if (allFixed) {
+          bestFixVersion = version;
+          right = mid - 1; // Look for earlier version
+          logger.debug('Binary search: CVEs fixed in version', {
+            version,
+            position: mid
+          });
+        } else {
+          left = mid + 1; // Look for later version
+          logger.debug('Binary search: CVEs not fixed in version', {
+            version,
+            position: mid
+          });
+        }
+
+      } catch (error) {
+        logger.warn('Error during binary search', {
+          imageName,
+          version,
+          error: error.message
+        });
+        // Continue search by eliminating this version
+        left = mid + 1;
+      }
+    }
+
+    if (bestFixVersion) {
+      logger.info('Binary search found minimal fix version', {
+        imageName,
+        fixedVersion: bestFixVersion
+      });
+    } else {
+      logger.warn('Binary search found no fix version', {
+        imageName,
+        cveIds
+      });
+    }
+
+    return bestFixVersion;
+  }
+
+  // Check if all CVEs are fixed in a specific version
+  async checkAllCVEsFixed(imageName, version, cveIds) {
+    try {
+      const cacheKey = `${imageName}:${version}:${cveIds.sort().join(',')}`;
+      
+      if (this.cache.has(cacheKey)) {
+        const cached = this.cache.get(cacheKey);
+        logger.debug('Using cached multi-CVE result', { imageName, version, cveCount: cveIds.length });
+        return cached;
+      }
+
+      const multiCVECheck = await this.trivyTool.checkMultipleCVEsInVersion(
+        imageName,
+        version,
+        cveIds
+      );
+
+      // Check if all requested CVEs are fixed (not present)
+      const allFixed = cveIds.every(cveId => {
+        const cveResult = multiCVECheck.results[cveId];
+        return cveResult && !cveResult.exists;
+      });
+
+      // Cache the result
+      this.cache.set(cacheKey, allFixed);
+
+      logger.debug('Multi-CVE check result', {
+        imageName,
+        version,
+        allFixed,
+        fixedCount: Object.values(multiCVECheck.results).filter(r => !r.exists).length,
+        totalCount: cveIds.length
+      });
+
+      return allFixed;
+
+    } catch (error) {
+      logger.error('Failed to check if all CVEs are fixed', {
+        imageName,
+        version,
+        cveIds,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  // Create detailed version information for the result
+  createVersionDetails(fixedVersion, fixedCVEs, unfixedCVEs, currentVersion) {
+    if (!fixedVersion) {
+      return `Unable to find a version that fixes all CVEs. ${unfixedCVEs.length} CVEs remain unfixed in all available versions.`;
+    }
+
+    const parts = [];
+    
+    if (fixedCVEs.length > 0) {
+      parts.push(`Fixed ${fixedCVEs.length} CVE(s) by upgrading from ${currentVersion} to ${fixedVersion}`);
+    }
+    
+    if (unfixedCVEs.length > 0) {
+      parts.push(`${unfixedCVEs.length} CVE(s) cannot be fixed and require manual attention: ${unfixedCVEs.join(', ')}`);
+    }
+
+    return parts.join('. ');
+  }
+
+  // Utility method for delays
+  async delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
 }
 
 module.exports = VersionFinder; 

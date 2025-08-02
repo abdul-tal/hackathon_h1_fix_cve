@@ -1,40 +1,37 @@
 const CVEFixAgent = require('../agents/CVEFixAgent');
-const config = require('../config/config');
 const logger = require('./logger');
+
 const { v4: uuidv4 } = require('uuid');
 
 class CVEFixOrchestrator {
   constructor() {
     this.agent = null;
-    this.activeRequests = new Map(); // Track active requests
+    this.activeRequests = new Map();
     this.initializeAgent();
   }
 
-  // Initialize the CVE Fix Agent
+  // Initialize the CVE fix agent
   async initializeAgent() {
     try {
-      logger.info('Initializing CVE Fix Orchestrator');
-      
       this.agent = new CVEFixAgent();
-      
       logger.info('CVE Fix Orchestrator initialized successfully');
     } catch (error) {
       logger.error('Failed to initialize CVE Fix Orchestrator', {
         error: error.message
       });
-      throw new Error(`Failed to initialize orchestrator: ${error.message}`);
+      throw new Error(`Orchestrator initialization failed: ${error.message}`);
     }
   }
 
-  // Main entry point for CVE fixing requests
+  // Main entry point for CVE fixing requests (updated for GitHub integration)
   async processCVEFix(request) {
     const requestId = uuidv4();
     const startTime = Date.now();
 
     try {
-      logger.info('Processing CVE fix request', {
+      logger.info('Processing comprehensive CVE fix request', {
         requestId,
-        cveId: request.cve_id
+        githubRepo: request.github_repo
       });
 
       // Validate request
@@ -48,13 +45,13 @@ class CVEFixOrchestrator {
 
       // Track active request
       this.activeRequests.set(requestId, {
-        cveId: request.cve_id,
+        githubRepo: request.github_repo,
         startTime,
         status: 'processing'
       });
 
-      // Execute the CVE fixing workflow
-      const result = await this.executeWorkflow(request.cve_id, requestId);
+      // Execute the comprehensive CVE fixing workflow
+      const result = await this.executeGitHubWorkflow(request.github_repo, request.github_token, requestId);
 
       // Calculate processing time
       const processingTime = Date.now() - startTime;
@@ -68,10 +65,17 @@ class CVEFixOrchestrator {
         message: result.message || 'CVE fix completed',
         original_version: result.original_version || null,
         fixed_version: result.fixed_version || null,
-        cve_details: result.cve_details || {
-          severity: 'UNKNOWN',
-          description: 'No details available'
+        cve_summary: result.cve_summary || {
+          total_found: 0,
+          total_fixed: 0,
+          unfixable: 0,
+          severity_breakdown: { LOW: 0, MEDIUM: 0, HIGH: 0, CRITICAL: 0 }
         },
+        github_info: result.github_info || {
+          repository: request.github_repo,
+          dockerfile_path: null
+        },
+        build_info: result.build_info || null,
         requestId,
         processingTime: `${processingTime}ms`,
         timestamp: new Date().toISOString()
@@ -79,8 +83,10 @@ class CVEFixOrchestrator {
 
       logger.info('CVE fix request completed', {
         requestId,
-        cveId: request.cve_id,
+        githubRepo: request.github_repo,
         status: finalResult.status,
+        totalCVEs: finalResult.cve_summary.total_found,
+        fixedCVEs: finalResult.cve_summary.total_fixed,
         processingTime
       });
 
@@ -89,145 +95,129 @@ class CVEFixOrchestrator {
     } catch (error) {
       const processingTime = Date.now() - startTime;
       
+      // Remove from active requests
+      this.activeRequests.delete(requestId);
+
       logger.error('CVE fix request failed', {
         requestId,
-        cveId: request.cve_id,
+        githubRepo: request.github_repo,
         error: error.message,
         stack: error.stack,
         processingTime
       });
 
-      // Remove from active requests
-      this.activeRequests.delete(requestId);
-
-      // Create comprehensive error response
-      const errorResponse = this.createErrorResponse(
-        requestId, 
-        error.message.includes('timeout') ? 'timeout' : 'processing_failed', 
-        `CVE fix failed: ${error.message}`
-      );
-      errorResponse.processingTime = `${processingTime}ms`;
-
-      return errorResponse;
+      return this.createErrorResponse(requestId, 'processing_failed', error.message, {
+        processingTime: `${processingTime}ms`,
+        github_info: {
+          repository: request.github_repo,
+          dockerfile_path: null
+        }
+      });
     }
   }
 
-  // Validate incoming request
-  async validateRequest(request) {
-    const validation = {
-      isValid: true,
-      error: null
-    };
-
+  // Execute the GitHub-based CVE fix workflow
+  async executeGitHubWorkflow(githubRepo, githubToken, requestId) {
     try {
-      // Validate CVE ID format
-      if (!request.cve_id) {
-        validation.isValid = false;
-        validation.error = 'CVE ID is required';
-        return validation;
-      }
-
-      const cvePattern = /^CVE-\d{4}-\d{4,}$/;
-      if (!cvePattern.test(request.cve_id)) {
-        validation.isValid = false;
-        validation.error = 'CVE ID must be in format CVE-YYYY-NNNN';
-        return validation;
-      }
-
-      // Validate Dockerfile exists at project root
-      const fs = require('fs-extra');
-      const dockerfilePath = config.dockerfile.path;
-      
-      if (!await fs.pathExists(dockerfilePath)) {
-        validation.isValid = false;
-        validation.error = `Dockerfile not found at ${dockerfilePath}`;
-        return validation;
-      }
-
-      // Additional validation can be added here
-      logger.debug('Request validation passed', {
-        cveId: request.cve_id,
-        dockerfilePath
+      logger.info('Executing GitHub CVE fix workflow', {
+        requestId,
+        githubRepo
       });
 
-    } catch (error) {
-      validation.isValid = false;
-      validation.error = `Validation error: ${error.message}`;
-    }
-
-    return validation;
-  }
-
-  // Execute the complete CVE fixing workflow
-  async executeWorkflow(cveId, requestId) {
-    const workflowLogger = logger.child({ requestId, cveId });
-    const startTime = Date.now();
-    
-    try {
-      workflowLogger.info('Starting CVE fix workflow');
-
-      // Update request status
-      if (this.activeRequests.has(requestId)) {
-        this.activeRequests.get(requestId).status = 'executing';
+      // Ensure agent is initialized
+      if (!this.agent) {
+        await this.initializeAgent();
       }
 
-      // Set up workflow timeout (3.5 minutes to leave buffer for API response)
-      const workflowTimeout = new Promise((_, reject) => {
-        setTimeout(() => {
-          workflowLogger.warn('CVE fix workflow timeout');
-          reject(new Error('CVE fix workflow timed out after 3.5 minutes'));
-        }, 210000); // 3.5 minutes
-      });
+      // Execute the comprehensive CVE fix workflow
+      const result = await this.agent.fixCVEsFromGitHub(githubRepo, githubToken);
 
-      // Race between the actual workflow and timeout
-      const result = await Promise.race([
-        this.agent.fixCVE(cveId, config.dockerfile.path),
-        workflowTimeout
-      ]);
-
-      const processingTime = Date.now() - startTime;
-      workflowLogger.info('CVE fix workflow completed', {
+      logger.info('GitHub CVE fix workflow completed', {
+        requestId,
+        githubRepo,
         status: result.status,
-        originalVersion: result.original_version,
-        fixedVersion: result.fixed_version,
-        processingTime: `${processingTime}ms`
+        totalCVEs: result.cve_summary?.total_found || 0,
+        fixedCVEs: result.cve_summary?.total_fixed || 0
       });
 
       return result;
 
     } catch (error) {
-      const processingTime = Date.now() - startTime;
-      workflowLogger.error('CVE fix workflow failed', {
-        error: error.message,
-        stack: error.stack,
-        processingTime: `${processingTime}ms`
+      logger.error('GitHub CVE fix workflow failed', {
+        requestId,
+        githubRepo,
+        error: error.message
       });
-      
-      // Clean up request tracking
-      if (this.activeRequests.has(requestId)) {
-        this.activeRequests.get(requestId).status = 'failed';
-      }
-      
-      throw error;
+      throw new Error(`GitHub workflow failed: ${error.message}`);
     }
   }
 
+  // Validate request (updated for GitHub parameters)
+  async validateRequest(request) {
+    try {
+      // Check required fields
+      if (!request.github_repo || !request.github_token) {
+        return {
+          isValid: false,
+          error: 'Missing required fields: github_repo and github_token are required'
+        };
+      }
+
+      // Validate GitHub repo format
+      if (!this.isValidGitHubRepo(request.github_repo)) {
+        return {
+          isValid: false,
+          error: 'Invalid GitHub repository format. Expected: owner/repo'
+        };
+      }
+
+      // Basic token validation
+      if (typeof request.github_token !== 'string' || request.github_token.length < 10) {
+        return {
+          isValid: false,
+          error: 'Invalid GitHub token format'
+        };
+      }
+
+      return { isValid: true };
+
+    } catch (error) {
+      logger.error('Request validation failed', {
+        error: error.message
+      });
+      return {
+        isValid: false,
+        error: `Validation error: ${error.message}`
+      };
+    }
+  }
+
+  // Validate GitHub repository format
+  isValidGitHubRepo(repo) {
+    if (!repo || typeof repo !== 'string') {
+      return false;
+    }
+    const parts = repo.split('/');
+    return parts.length === 2 && parts[0].length > 0 && parts[1].length > 0;
+  }
+
   // Create error response
-  createErrorResponse(requestId, errorType, errorMessage) {
+  createErrorResponse(requestId, errorType, message, additionalData = {}) {
     return {
       status: 'failure',
-      message: errorMessage || 'CVE fix operation failed',
+      message: `CVE fix failed: ${message}`,
       original_version: null,
       fixed_version: null,
-      cve_details: {
-        severity: 'UNKNOWN',
-        description: errorType === 'timeout' ? 'Request timeout' : 
-                     errorType === 'validation_failed' ? 'Validation failed' : 
-                     'Processing failed'
+      cve_summary: {
+        total_found: 0,
+        total_fixed: 0,
+        unfixable: 0,
+        severity_breakdown: { LOW: 0, MEDIUM: 0, HIGH: 0, CRITICAL: 0 }
       },
-      requestId: requestId || 'unknown',
+      requestId,
+      errorType,
       timestamp: new Date().toISOString(),
-      errorType: errorType || 'unknown_error'
+      ...additionalData
     };
   }
 
@@ -236,7 +226,7 @@ class CVEFixOrchestrator {
     const activeCount = this.activeRequests.size;
     const activeRequests = Array.from(this.activeRequests.entries()).map(([id, info]) => ({
       requestId: id,
-      cveId: info.cveId,
+      githubRepo: info.githubRepo,
       status: info.status,
       runtime: Date.now() - info.startTime
     }));
@@ -274,7 +264,7 @@ class CVEFixOrchestrator {
 
       // Check Dockerfile accessibility
       const fs = require('fs-extra');
-      const dockerfilePath = config.dockerfile.path;
+      const dockerfilePath = require('../config/config').dockerfile.path;
       
       health.components.dockerfile = {
         status: await fs.pathExists(dockerfilePath) ? 'healthy' : 'unhealthy',
@@ -404,7 +394,7 @@ class CVEFixOrchestrator {
     if (request) {
       return {
         requestId,
-        cveId: request.cveId,
+        githubRepo: request.githubRepo,
         status: request.status,
         startTime: request.startTime,
         runtime: Date.now() - request.startTime,
@@ -476,7 +466,7 @@ class CVEFixOrchestrator {
 
       // Check Dockerfile existence
       const fs = require('fs-extra');
-      const dockerfilePath = config.dockerfile.path;
+      const dockerfilePath = require('../config/config').dockerfile.path;
       const dockerfileExists = await fs.pathExists(dockerfilePath);
       
       requirements.checks.push({
