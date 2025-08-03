@@ -71,6 +71,13 @@ const startServer = async () => {
             await orchestratorInstance.cleanup();
           }
           
+          // Cleanup git repositories
+          const routes = require('./api/routes');
+          if (routes.gitRepoTool) {
+            logger.info('Cleaning up git repositories');
+            await routes.gitRepoTool.cleanupAllRepositories();
+          }
+          
           logger.info('Graceful shutdown completed');
           process.exit(0);
         } catch (error) {

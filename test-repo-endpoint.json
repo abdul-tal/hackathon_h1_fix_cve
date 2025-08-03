@@ -1,0 +1,5 @@
+{
+  "repo_url": "https://github.com/nginx/nginx-docker.git",
+  "github_token": "fake_token_for_demo",
+  "branch": "master"
+}

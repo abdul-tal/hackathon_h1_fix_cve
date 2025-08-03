@@ -37,6 +37,67 @@ const validateFixCveRequest = (req, res, next) => {
   next();
 };
 
+// Validate fix CVE repo request
+const validateFixCveRepoRequest = (req, res, next) => {
+  const schema = Joi.object({
+    repo_url: Joi.string()
+      .uri()
+      .required()
+      .messages({
+        'string.uri': 'Repository URL must be a valid URI',
+        'any.required': 'Repository URL is required'
+      }),
+    github_token: Joi.string()
+      .min(1)
+      .required()
+      .messages({
+        'string.min': 'GitHub token cannot be empty',
+        'any.required': 'GitHub token is required'
+      }),
+    branch: Joi.string()
+      .min(1)
+      .max(100)
+      .optional()
+      .messages({
+        'string.min': 'Branch name cannot be empty',
+        'string.max': 'Branch name too long'
+      }),
+    dockerfile_path: Joi.string()
+      .min(1)
+      .max(500)
+      .optional()
+      .messages({
+        'string.min': 'Dockerfile path cannot be empty',
+        'string.max': 'Dockerfile path too long'
+      })
+  });
+
+  const { error, value } = schema.validate(req.body);
+
+  if (error) {
+    req.logger.warn('Fix CVE repo request validation failed', {
+      requestId: req.id,
+      errors: error.details.map(detail => ({
+        field: detail.path.join('.'),
+        message: detail.message
+      }))
+    });
+
+    return res.status(400).json({
+      error: 'Validation failed',
+      details: error.details.map(detail => ({
+        field: detail.path.join('.'),
+        message: detail.message
+      })),
+      requestId: req.id,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  req.validatedBody = value;
+  next();
+};
+
 // Check if Dockerfile exists at project root
 const validateDockerfileExists = (req, res, next) => {
   const dockerfilePath = path.resolve('./Dockerfile');
@@ -69,6 +130,7 @@ const sanitizeInput = (req, res, next) => {
 
 module.exports = {
   validateFixCveRequest,
+  validateFixCveRepoRequest,
   validateDockerfileExists,
   sanitizeInput,
   cveIdPattern

@@ -26,6 +26,96 @@ class CVEFixOrchestrator {
     }
   }
 
+  // Main entry point for CVE fixing requests with custom Dockerfile path
+  async processCVEFixForPath(request) {
+    const requestId = uuidv4();
+    const startTime = Date.now();
+
+    try {
+      logger.info('Processing CVE fix request for custom path', {
+        requestId,
+        cveId: request.cve_id,
+        dockerfilePath: request.dockerfile_path
+      });
+
+      // Validate request
+      const validation = await this.validateRequestForPath(request);
+      if (!validation.isValid) {
+        const processingTime = Date.now() - startTime;
+        const errorResponse = this.createErrorResponse(requestId, 'validation_failed', validation.error);
+        errorResponse.processingTime = `${processingTime}ms`;
+        return errorResponse;
+      }
+
+      // Track active request
+      this.activeRequests.set(requestId, {
+        cveId: request.cve_id,
+        dockerfilePath: request.dockerfile_path,
+        startTime,
+        status: 'processing'
+      });
+
+      // Execute the CVE fixing workflow with custom path
+      const result = await this.executeWorkflowForPath(request.cve_id, request.dockerfile_path, requestId);
+
+      // Calculate processing time
+      const processingTime = Date.now() - startTime;
+
+      // Remove from active requests
+      this.activeRequests.delete(requestId);
+
+      // Ensure result has all required fields for consistency
+      const finalResult = {
+        status: result.status || 'failure',
+        message: result.message || 'CVE fix completed',
+        original_version: result.original_version || null,
+        fixed_version: result.fixed_version || null,
+        cve_details: result.cve_details || {
+          severity: 'UNKNOWN',
+          description: 'No details available'
+        },
+        requestId,
+        processingTime: `${processingTime}ms`,
+        timestamp: new Date().toISOString()
+      };
+
+      logger.info('CVE fix request for custom path completed', {
+        requestId,
+        cveId: request.cve_id,
+        dockerfilePath: request.dockerfile_path,
+        status: finalResult.status,
+        processingTime
+      });
+
+      return finalResult;
+
+    } catch (error) {
+      const processingTime = Date.now() - startTime;
+      
+      logger.error('CVE fix request for custom path failed', {
+        requestId,
+        cveId: request.cve_id,
+        dockerfilePath: request.dockerfile_path,
+        error: error.message,
+        stack: error.stack,
+        processingTime
+      });
+
+      // Remove from active requests
+      this.activeRequests.delete(requestId);
+
+      // Create comprehensive error response
+      const errorResponse = this.createErrorResponse(
+        requestId, 
+        error.message.includes('timeout') ? 'timeout' : 'processing_failed', 
+        `CVE fix failed: ${error.message}`
+      );
+      errorResponse.processingTime = `${processingTime}ms`;
+
+      return errorResponse;
+    }
+  }
+
   // Main entry point for CVE fixing requests
   async processCVEFix(request) {
     const requestId = uuidv4();
@@ -158,6 +248,56 @@ class CVEFixOrchestrator {
     return validation;
   }
 
+  // Validate incoming request for custom path
+  async validateRequestForPath(request) {
+    const validation = {
+      isValid: true,
+      error: null
+    };
+
+    try {
+      // Validate CVE ID format
+      if (!request.cve_id) {
+        validation.isValid = false;
+        validation.error = 'CVE ID is required';
+        return validation;
+      }
+
+      const cvePattern = /^CVE-\d{4}-\d{4,}$/;
+      if (!cvePattern.test(request.cve_id)) {
+        validation.isValid = false;
+        validation.error = 'CVE ID must be in format CVE-YYYY-NNNN';
+        return validation;
+      }
+
+      // Validate Dockerfile path
+      if (!request.dockerfile_path) {
+        validation.isValid = false;
+        validation.error = 'Dockerfile path is required';
+        return validation;
+      }
+
+      const fs = require('fs-extra');
+      if (!await fs.pathExists(request.dockerfile_path)) {
+        validation.isValid = false;
+        validation.error = `Dockerfile not found at ${request.dockerfile_path}`;
+        return validation;
+      }
+
+      // Additional validation can be added here
+      logger.debug('Request validation for custom path passed', {
+        cveId: request.cve_id,
+        dockerfilePath: request.dockerfile_path
+      });
+
+    } catch (error) {
+      validation.isValid = false;
+      validation.error = `Validation error: ${error.message}`;
+    }
+
+    return validation;
+  }
+
   // Execute the complete CVE fixing workflow
   async executeWorkflow(cveId, requestId) {
     const workflowLogger = logger.child({ requestId, cveId });
@@ -198,6 +338,60 @@ class CVEFixOrchestrator {
     } catch (error) {
       const processingTime = Date.now() - startTime;
       workflowLogger.error('CVE fix workflow failed', {
+        error: error.message,
+        stack: error.stack,
+        processingTime: `${processingTime}ms`
+      });
+      
+      // Clean up request tracking
+      if (this.activeRequests.has(requestId)) {
+        this.activeRequests.get(requestId).status = 'failed';
+      }
+      
+      throw error;
+    }
+  }
+
+  // Execute the complete CVE fixing workflow for custom path
+  async executeWorkflowForPath(cveId, dockerfilePath, requestId) {
+    const workflowLogger = logger.child({ requestId, cveId, dockerfilePath });
+    const startTime = Date.now();
+    
+    try {
+      workflowLogger.info('Starting CVE fix workflow for custom path');
+
+      // Update request status
+      if (this.activeRequests.has(requestId)) {
+        this.activeRequests.get(requestId).status = 'executing';
+      }
+
+      // Set up workflow timeout (3.5 minutes to leave buffer for API response)
+      const workflowTimeout = new Promise((_, reject) => {
+        setTimeout(() => {
+          workflowLogger.warn('CVE fix workflow timeout for custom path');
+          reject(new Error('CVE fix workflow timed out after 3.5 minutes'));
+        }, 210000); // 3.5 minutes
+      });
+
+      // Race between the actual workflow and timeout
+      const result = await Promise.race([
+        this.agent.fixCVE(cveId, dockerfilePath),
+        workflowTimeout
+      ]);
+
+      const processingTime = Date.now() - startTime;
+      workflowLogger.info('CVE fix workflow for custom path completed', {
+        status: result.status,
+        originalVersion: result.original_version,
+        fixedVersion: result.fixed_version,
+        processingTime: `${processingTime}ms`
+      });
+
+      return result;
+
+    } catch (error) {
+      const processingTime = Date.now() - startTime;
+      workflowLogger.error('CVE fix workflow for custom path failed', {
         error: error.message,
         stack: error.stack,
         processingTime: `${processingTime}ms`
